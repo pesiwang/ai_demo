@@ -53,12 +53,12 @@ print(f"vector_id literal_eval cost {t4-t3} seconds")
 article_df.info(show_counts=True)
 
 
-chroma_client = chromadb.Client() # Ephemeral. Comment out for the persistent version.
+#chroma_client = chromadb.Client() # Ephemeral. Comment out for the persistent version.
 
 # Uncomment the following for the persistent version.
 from chromadb.config import Settings
 persist_directory = './data/chroma_persistence' # Directory to store persisted Chroma data.
-client = chromadb.Client(
+chroma_client = chromadb.Client(
     Settings(
         persist_directory=persist_directory,
         chroma_db_impl="duckdb+parquet",
@@ -82,6 +82,9 @@ else:
 
 embedding_function = OpenAIEmbeddingFunction(api_key=os.environ.get('OPENAI_API_KEY'), model_name=EMBEDDING_MODEL)
 
+chroma_client.delete_collection(name='wikipedia_content')
+chroma_client.delete_collection(name='wikipedia_titles')
+
 wikipedia_content_collection = chroma_client.create_collection(name='wikipedia_content', embedding_function=embedding_function)
 wikipedia_title_collection = chroma_client.create_collection(name='wikipedia_titles', embedding_function=embedding_function)
 
@@ -89,6 +92,7 @@ wikipedia_title_collection = chroma_client.create_collection(name='wikipedia_tit
 # Add the content vectors
 wikipedia_content_collection.add(
     ids=article_df.vector_id.tolist(),
+    documents=article_df.text.tolist(),
     embeddings=article_df.content_vector.tolist(),
 )
 
@@ -98,19 +102,19 @@ print(f" Add the content vectors cost {t5-t4} seconds")
 # Add the title vectors
 wikipedia_title_collection.add(
     ids=article_df.vector_id.tolist(),
+    documents=article_df.title.tolist(),
     embeddings=article_df.title_vector.tolist(),
 )
 
 t6 = time.time()
 print(f" Add the title vectors cost {t6-t5} seconds")
 
-def query_collection(collection, query, max_results, dataframe):
-    results = collection.query(query_texts=query, n_results=max_results, include=['distances'])
+def query_collection(collection, query, max_results):
+    results = collection.query(query_texts=query, n_results=max_results, include=['distances', 'documents'])
     df = pd.DataFrame({
         'id': results['ids'][0],
-        'score': results['distances'][0],
-        'title': dataframe[dataframe.vector_id.isin(results['ids'][0])]['title'],
-        'content': dataframe[dataframe.vector_id.isin(results['ids'][0])]['text'],
+        'distance': results['distances'][0],
+        'document': results['documents'][0],
     })
 
     return df
@@ -119,19 +123,10 @@ title_query_result = query_collection(
     collection=wikipedia_title_collection,
     query="modern art in Europe",
     max_results=5,
-    dataframe=article_df
 )
 
-print(title_query_result.head(5))
-
-title_query_result2 = query_collection(
-    collection=wikipedia_title_collection,
-    query="modern art in Europe",
-    max_results=2,
-    dataframe=article_df
-)
 t7 = time.time()
-print(title_query_result2.head(2))
+print(title_query_result.head(5))
 
 print(f" query title cost {t7-t6} seconds")
 
@@ -139,7 +134,6 @@ content_query_result = query_collection(
     collection=wikipedia_content_collection,
     query="Famous battles in Scottish history",
     max_results=3,
-    dataframe=article_df
 )
 
 t8 = time.time()
