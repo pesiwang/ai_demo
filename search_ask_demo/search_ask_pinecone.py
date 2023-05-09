@@ -11,24 +11,82 @@ from ast import literal_eval
 import pinecone
 
 
+
 # I've set this to our new embeddings model, this can be changed to the embedding model of your choice
 EMBEDDING_MODEL = "text-embedding-ada-002"
+pinecone.api_key = os.getenv("PINECONE_API_KEY")
+print(f"pinecone api key:{pinecone.api_key}")
+pinecone.init(api_key=pinecone.api_key, environment='northamerica-northeast1-gcp')
 
-# Ignore unclosed SSL socket warnings - optional in case you get these errors
-#import warnings
-#
-#warnings.filterwarnings(action="ignore", message="unclosed", category=ResourceWarning)
-#warnings.filterwarnings("ignore", category=DeprecationWarning)
-#
-#embeddings_url = 'https://cdn.openai.com/API/examples/data/vector_database_wikipedia_articles_embedded.zip'
-#
-## The file is ~700 MB so this will take some time
-#wget.download(embeddings_url)
 
-#import zipfile
-#with zipfile.ZipFile("vector_database_wikipedia_articles_embedded.zip","r") as zip_ref:
-#    zip_ref.extractall("./data")
-#
+if os.getenv("OPENAI_API_KEY") is not None:
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+    print ("OPENAI_API_KEY is ready")
+else:
+    print ("OPENAI_API_KEY environment variable not found")
+
+
+
+# Models a simple batch generator that make chunks out of an input DataFrame
+class BatchGenerator:
+
+    def __init__(self, batch_size: int = 10) -> None:
+        self.batch_size = batch_size
+
+    # Makes chunks out of an input DataFrame
+    def to_batches(self, df: pd.DataFrame) -> Iterator[pd.DataFrame]:
+        splits = self.splits_num(df.shape[0])
+        if splits <= 1:
+            yield df
+        else:
+            for chunk in np.array_split(df, splits):
+                yield chunk
+
+    # Determines how many chunks DataFrame contains
+    def splits_num(self, elements: int) -> int:
+        return round(elements / self.batch_size)
+
+    __call__ = to_batches
+
+
+def query_article(query, namespace, top_k=5):
+    '''Queries an article using its title in the specified
+     namespace and prints results.'''
+
+    # Create vector embeddings based on the title column
+    embedded_query = openai.Embedding.create(
+        input=query,
+        model=EMBEDDING_MODEL,
+    )["data"][0]['embedding']
+
+    # Query namespace passed as parameter using title vector
+    query_result = index.query(embedded_query,
+                               namespace=namespace,
+                               top_k=top_k)
+
+    # Print query results
+    print(f'\nMost similar results to {query} in "{namespace}" namespace:\n')
+    if not query_result.matches:
+        print('no query result')
+
+    matches = query_result.matches
+    ids = [res.id for res in matches]
+    scores = [res.score for res in matches]
+    df = pd.DataFrame({'id': ids,
+                       'score': scores,
+                       'title': [titles_mapped[_id] for _id in ids],
+                       'content': [content_mapped[_id] for _id in ids],
+                       })
+
+    counter = 0
+    for k, v in df.iterrows():
+        counter += 1
+        print(f'{v.title} (score = {v.score})')
+
+    print('\n')
+
+    return df
+
 article_df = pd.read_csv('./data/vector_database_wikipedia_articles_embedded.csv')
 
 print(article_df.head())
@@ -41,78 +99,47 @@ article_df['vector_id'] = article_df['vector_id'].apply(str)
 
 article_df.info(show_counts=True)
 
+df_batcher = BatchGenerator(300)
 
-chroma_client = chromadb.Client() # Ephemeral. Comment out for the persistent version.
+# Pick a name for the new index
+index_name = 'wikipedia-articles'
 
-# Uncomment the following for the persistent version.
-# import chromadb.config.Settings
-# persist_directory = 'chroma_persistence' # Directory to store persisted Chroma data.
-# client = chromadb.Client(
-#     Settings(
-#         persist_directory=persist_directory,
-#         chroma_db_impl="duckdb+parquet",
-#     )
-# )
+# Check whether the index with the same name already exists - if so, delete it
+if index_name in pinecone.list_indexes():
+    pinecone.delete_index(index_name)
 
-from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+# Creates new index
+pinecone.create_index(name=index_name, dimension=len(article_df['content_vector'][0]))
+index = pinecone.Index(index_name=index_name)
 
-# Test that your OpenAI API key is correctly set as an environment variable
-# Note. if you run this notebook locally, you will need to reload your terminal and the notebook for the env variables to be live.
+# Confirm our index was created
+print(pinecone.list_indexes())
 
-# Note. alternatively you can set a temporary env variable like this:
-# os.environ["OPENAI_API_KEY"] = 'sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+index.describe_index_stats()
 
-if os.getenv("OPENAI_API_KEY") is not None:
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    print ("OPENAI_API_KEY is ready")
-else:
-    print ("OPENAI_API_KEY environment variable not found")
+# Upsert content vectors in content namespace - this can take a few minutes
+print("Uploading vectors to content namespace..")
+for batch_df in df_batcher(article_df):
+    index.upsert(vectors=zip(batch_df.vector_id, batch_df.content_vector), namespace='content')
 
+# Upsert title vectors in title namespace - this can also take a few minutes
+print("Uploading vectors to title namespace..")
+for batch_df in df_batcher(article_df):
+    index.upsert(vectors=zip(batch_df.vector_id, batch_df.title_vector), namespace='title')
 
-embedding_function = OpenAIEmbeddingFunction(api_key=os.environ.get('OPENAI_API_KEY'), model_name=EMBEDDING_MODEL)
-
-wikipedia_content_collection = chroma_client.create_collection(name='wikipedia_content', embedding_function=embedding_function)
-wikipedia_title_collection = chroma_client.create_collection(name='wikipedia_titles', embedding_function=embedding_function)
+# Check index size for each namespace to confirm all of our docs have loaded
+index.describe_index_stats()
 
 
-# Add the content vectors
-wikipedia_content_collection.add(
-    ids=article_df.vector_id.tolist(),
-    embeddings=article_df.content_vector.tolist(),
-)
+# First we'll create dictionaries mapping vector IDs to their outputs so we can retrieve the text for our search results
+titles_mapped = dict(zip(article_df.vector_id,article_df.title))
+content_mapped = dict(zip(article_df.vector_id,article_df.text))
 
-# Add the title vectors
-wikipedia_title_collection.add(
-    ids=article_df.vector_id.tolist(),
-    embeddings=article_df.title_vector.tolist(),
-)
+query_output = query_article('modern art in Europe','title')
 
+content_query_output = query_article("Famous battles in Scottish history",'content')
 
-def query_collection(collection, query, max_results, dataframe):
-    results = collection.query(query_texts=query, n_results=max_results, include=['distances'])
-    df = pd.DataFrame({
-        'id': results['ids'][0],
-        'score': results['distances'][0],
-        'title': dataframe[dataframe.vector_id.isin(results['ids'][0])]['title'],
-        'content': dataframe[dataframe.vector_id.isin(results['ids'][0])]['text'],
-    })
+print(query_output)
+print(content_query_output)
 
-    return df
-
-title_query_result = query_collection(
-    collection=wikipedia_title_collection,
-    query="modern art in Europe",
-    max_results=10,
-    dataframe=article_df
-)
-
-title_query_result.head()
-
-content_query_result = query_collection(
-    collection=wikipedia_content_collection,
-    query="Famous battles in Scottish history",
-    max_results=10,
-    dataframe=article_df
-)
-content_query_result.head()
 
